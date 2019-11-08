@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# tags: aws security group reporting management k8s elb SG limit
+#
+# This script was created to remove our blocking issues with AWS security group inbound rule limits--maxing out due to orphaned AWS K8S ELB referenced security groups.
+# With our constant CI, etc. kube processes, we continue to accumulate a high number of orphaned / referenced security groups from non-existent ELB-based kubernetes services
+# in our EKS worker security groups.  
+# This is apparently due to issues with services with Kind: 'LoadBalancer'.  
+# We are using a global ingress, but still seeing this problem with enough services to cause us problems in our version 1.13 EKS clusters.
+#
+# Disclaimer: we have inceased our AWS inbound rules per security group limit and suggest that everyone else do as well.
+#
+# TL;DR
+# This script reports on (and can dereference and delete) child (referenced) security groups on the specified parent security group (EKS worker SG).
+#
+# To report the referenced security groups of your parent security group and be prompted to proceed with dereferencing and deleting of the orphaned (child) K8S ELB security groups execute with the below option:
+# $0 parent=sg-00d1eb0508f5c1234 mode=purge
+#
+# Usage/help: (see usage below)
+# $0 help
+#
+# Below are a few supporting issues requiring the creation of this tool for us:
+# ref: https://github.com/kubernetes/kops/issues/2721
+# Every time you create a service with load balancer type it adds the SG rule to the SG attached to the nodes, 
+# because there's a limit on the number of rules you can have attached to a SG you have a hard limit on the amount 
+# of loadbalancer services (max 250 depending on your infrastructure.)
+# Solution to this is ingress.
+#
+# ref: https://github.com/kubernetes/kubernetes/issues/26670
+# Introduce Shared Security Group to Allow Traffic from Unlimited Number of ELBs. #26670
+#
+# https://docs.aws.amazon.com/vpc/latest/userguide/amazon-vpc-limits.html#vpc-limits-security-groups
+# Inbound or outbound rules per security group
+# default=60
+# You can have 60 inbound and 60 outbound rules per security group (making a total of 120 rules). 
+# This limit is enforced separately for IPv4 rules and IPv6 rules; for example, a security group can have 60 inbound 
+# rules for IPv4 traffic and 60 inbound rules for IPv6 traffic. A rule that references a security group or prefix list 
+# ID counts as one rule for IPv4 and one rule for IPv6.
+# A limit change applies to both inbound and outbound rules. 
+# This limit multiplied by the limit for security groups per  network interface cannot exceed 1000. 
+# For example, if you increase this limit to 100, we decrease the limit for your number of security groups per network interface to 10.
+#
+# ref: https://github.com/kubernetes/kubernetes/pull/62774
+# Fixes #49445 by adding additional annotation to define ELB security group (AWS) #62774
+#
+
+set -e
+set -u
+set -o pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+SET='\033[0m'
+REGION="us-west-2"
+
+mode="report" # by default we only run report--pass in 'mode=delete-child-groups' to dereference and delete orphaned SG's.
+parent_sg=""
+
+usage() { printf "\n${SET}Usage: $0 parent=<parent_sg_id> mode=[report,purge]\ni.e.: $0 parent=sg-00d1eb0508f5c1234 mode=purge\n\n" 1>&2; exit 1; }
+
+for ARGUMENT in "$@"
+do
+    KEY=$(printf $ARGUMENT | cut -f1 -d=)
+    VALUE=$(printf $ARGUMENT | cut -f2 -d=)   
+
+    case "$KEY" in
+            parent)           
+            parent_sg=${VALUE}
+            export parent_sg ;;
+
+            mode)           
+            mode=${VALUE}
+            export mode ;;
+
+            help)
+            usage;
+            exit $?;;
+
+            *)   
+            usage;
+            exit $?;;
+    esac    
+done
+
+if [[ -z "${parent_sg}" ]] || [[ -z "${mode}" ]]; then
+    usage
+fi
+
+if [[ "$mode" != "report" ]] && [[ "$mode" != "purge" ]]; then
+    printf "\n${SET}ERROR: 'mode' unknown value: $mode\n"
+    usage
+    exit $?
+fi
+
+printf "\n${SET}mode: $mode${SET}"
+printf "\n${SET}parent_sg: $parent_sg${SET}\n"
+
+# get our list of depedent child referenced SGs that are in our parent (EKS worker) SG
+dep_child_sg_list=$(aws ec2 describe-security-groups --group-id $parent_sg --query "SecurityGroups[*].{ID:GroupId,Name:GroupName,dependentOnSGs:IpPermissions[].UserIdGroupPairs[].GroupId}" --output text | grep 'DEPENDENTONSGS' | awk -F " " '{print $2}' | tr '\n' ' ')
+
+# limit our SG to our list above of the referenced child SGs that are in our parent (EKS worker) SG.
+sg_report=$(aws ec2 describe-security-groups --group-id $dep_child_sg_list --query "SecurityGroups[].[GroupId, GroupName, Description]" --output text)
+
+declare elb_sg_array
+
+FORMAT_HEADER="\n[SG-ID],   [Number of NIC references],     [SG-Name],           [SG-Description]\n"
+printf "\n${GREEN}REPORT (#1 of 3): All referenced SG's from specified Parent security group.\n"
+printf "${FORMAT_HEADER}"
+while read -r line; do
+    sg_id=$(echo $line | awk '{print $1;}')
+    sg_name=$(echo $line | awk '{print $2;}')
+    nic=$(aws ec2 describe-network-interfaces --filters "Name=group-id,Values=$sg_id" --query "length(NetworkInterfaces)" --output text)
+    #desc=$(echo $line | awk '{print $3,$4,$5,$6,$7}') # see below for better method
+    desc=$(echo $line | awk '{ for (i = 5; i <= NF; i++) { printf "%s ", $i } }')
+
+    # build referenced child ELB SG report push into array if sg_name regex match *elb*
+    # sg-09b7527573cb15fd4,0,k8s-elb-a0ff695f5bacf11e983a902254af0778,for Kubernetes ELB a0ff695f5bacf11e983a902254af0778 (nginx-test/nginx)
+    if [[ $sg_name =~ elb ]]; then
+        elb_sg_array=("${elb_sg_array[@]}" "$sg_id,$nic,$sg_name,$desc")
+    fi 
+
+    # build referenced non-operator child ELB SG report if NIC count=0 (i.e. likely canidates for purge) 
+    #if [[ "$sg_name" =~ "elb" && "$nic" == "0" && "$desc" != *"operator"* ]]; then # if we needed to skip some operators ELB SG's
+    if [[ "$sg_name" =~ "elb" && "$nic" == "0" ]]; then
+        elb_sg_zero_nic_array=("${elb_sg_zero_nic_array[@]}" "$sg_id,$nic,$sg_name,$desc")
+        #[[ $nic == ?(-)+([0-9]) ]] && echo "$1 is an integer" # probably should test for int here
+    fi 
+
+    # Show All SGs print each line of the child SGs array--i.e.: The main SG report
+    printf "$sg_id,$nic,$sg_name,$desc\n"
+done <<< "$sg_report"
+
+# show only ELB SGs
+printf "\n${YELLOW}REPORT (#2 of 3): All Referenced Child ELB SG's:"
+printf "\n${FORMAT_HEADER}"
+printf "%s\n" "${elb_sg_array[@]}" ## print array
+printf "${SET}"
+
+# show ELB SGs that have NIC=0 i.e. likely unused SGs we might want to dereference and delete
+printf "\n${RED}REPORT (#3 of 3): ELB SG's with '0' Network Interface Associations: i.e.: candidates for dereferencing and deleting"
+printf "\n${FORMAT_HEADER}"
+printf "%s\n" "${elb_sg_zero_nic_array[@]}" ## print array
+printf "${SET}"
+printf "\n"
+
+if [[ "$mode" == "report" ]]; then
+    printf "\n${SET}Default 'mode' set to: $mode"
+    printf "\nReport only mode, now exiting without modifications...\n\n"
+    exit
+elif [[ "$mode" == "purge" ]]; then
+    printf "\n${RED}Confirm the DEREFERENCE and DELETION all SG's listed in the above report (#3 of 3) as shown immediately above?"
+    read -p " (y/n)? " answer
+    case ${answer:0:1} in
+        y|Y )
+            printf "\nYes, Dereferencing and deleting specified SG's...\n"
+            for line_to_del in "${elb_sg_zero_nic_array[@]}"
+            do
+                sg_id_to_delete=$(echo $line_to_del | awk -F "," '{print $1;}')
+                printf "\nExecuting: aws ec2 revoke-security-group-ingress --group-id $parent_sg --source-group $sg_id_to_delete --region $REGION --protocol -1\n"
+                aws ec2 revoke-security-group-ingress --group-id $parent_sg --source-group $sg_id_to_delete --region $REGION --protocol -1
+                printf "\nExecuting: aws ec2 delete-security-group --group-id $sg_id_to_delete --region $REGION\n"
+                aws ec2 delete-security-group --group-id $sg_id_to_delete --region $REGION
+            done
+            printf "${SET}\nClean-up complete.\nRe-run script to see updated SG lists and references.\n\n"
+        ;;
+
+        * )
+            printf "\n${GREEN}No, exiting...${SET}\n"
+            printf "\n"
+            exit 1
+
+        ;;
+    esac
+else
+    printf "\n${SET}ERROR: 'mode' unknown value: $mode"
+fi
+
+printf "${SET}"
